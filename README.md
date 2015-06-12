@@ -14,6 +14,7 @@ A template must contains the following items:
  - maintainer, map to `MAINTAINER` in the Dockerfile
  - environment, map to `ENV` in the Dockerfile, it must be an mapping
  - command, map to `CMD` in the Dockerfile
+ - entrypoint, map to `ENTRYPOINT` in the Dockerfile
  - execute, a sequence of step to execute.
 
 Step types

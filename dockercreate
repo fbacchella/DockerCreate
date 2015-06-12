@@ -141,7 +141,10 @@ def generate_mime(object_content):
             if key in entry:
                 # mode (X-Mode) must be an octal string
                 if key == "mode":
-                    custom_headers[mime_header] = oct(entry[key])
+                    try:
+                        custom_headers[mime_header] = oct(entry[key])
+                    except TypeError:
+                        print >> sys.stderr, "%s is not valid form permissions" % entry[key]
                 else:
                     custom_headers[mime_header] = "%s" % entry[key]
 
@@ -237,6 +240,8 @@ class Create(Command):
                 print >> dockerfile, "ENV %s %s" % env
         if "command" in yaml_content:
             print >> dockerfile, 'CMD ["%s"]' % yaml_content['command']
+        if "entrypoint" in yaml_content:
+            print >> dockerfile, 'ENTRYPOINT "%s"' % yaml_content['entrypoint']
         print >> dockerfile, "COPY run /tmp/run"
         print >> dockerfile, "COPY mimecontent /tmp/mimecontent"
         print >> dockerfile, 'RUN ["python", "/tmp/run", "decode", "-f", "/tmp/mimecontent", "--purge" ]'
@@ -360,7 +365,7 @@ class MimeDecode(Command):
                 mode = int(msg.get('X-Mode'), 8)
                 os.chmod(file_name, mode)
             except:
-                print "invalid mode: %s for %s" % (msg.get('X-Mode'), file_name)
+                print >> sys.stderr, "invalid mode: %s for %s" % (msg.get('X-Mode'), file_name)
         return os.path.abspath(file_name)
 
     def run_command(self, msg):
