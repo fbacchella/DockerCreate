@@ -1,0 +1,481 @@
+#!/usr/bin/python
+
+import base64
+import email
+import gzip
+import mimetypes
+import optparse
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import tempfile
+import shutil
+import string
+import re
+import StringIO
+import urllib2
+
+from email import Encoders
+from email.MIMEMultipart import MIMEMultipart
+from email.MIMEText import MIMEText
+from email.MIMEBase import MIMEBase
+from email.MIMEMultipart import MIMEMultipart
+
+# a template that allows . in variables name
+class DotTemplate(string.Template):
+    pattern = r"""
+    \$(?:
+      {{(?P<braced>[_a-z][_a-z0-9\.]+)}}   |   # delimiter and a braced identifier
+      (?P<escaped>^$)                      |   # Escape sequence of two delimiters
+      (?P<named>^$)                        |   # delimiter and a Python identifier
+      (?P<invalid>^$)                          # Other ill-formed delimiter exprs
+    )
+    """
+
+class VariablesOption(optparse.Option):
+    ACTIONS = optparse.Option.ACTIONS + ("store_variable", )
+    STORE_ACTIONS = optparse.Option.STORE_ACTIONS + ("store_variable", )
+    TYPED_ACTIONS = optparse.Option.TYPED_ACTIONS + ("store_variable", )
+    ALWAYS_TYPED_ACTIONS = optparse.Option.ALWAYS_TYPED_ACTIONS + ("store_variable", )
+
+    def __init__(self, *args, **kwargs):
+        if 'action' in kwargs and kwargs['action'] == "store_variable":
+            kwargs['nargs'] = 2
+            if not 'default' in kwargs:
+                kwargs['default'] = {}
+        optparse.Option.__init__(self, *args, **kwargs)
+
+    def take_action(self, action, dest, opt, value, values, parser):
+        if action == "store_variable":
+            (v_key, v_value) = value
+            values.variables[v_key] = v_value
+        else:
+            optparse.Option.take_action(self, action, dest, opt, value, values, parser)
+
+
+def write_mime_multipart(content, compress=False):
+    wrapper = MIMEMultipart()
+    for name, part_content, definite_type, custom_headers in content:
+        maintype, subtype = definite_type.split('/', 1)
+        if maintype == 'multipart' or definite_type == 'message/rfc822':
+            mime_con = MIMEBase(maintype, subtype)
+            mime_con.set_payload(part_content)
+        elif maintype == 'text' and 'Content-Encoding' not in custom_headers:
+            mime_con = MIMEText(part_content, _subtype=subtype)
+        else:
+            mime_con = MIMEBase(maintype, subtype)
+            mime_con.set_payload(part_content)
+            # Encode the payload using Base64
+            Encoders.encode_base64(mime_con)
+        if name is not None:
+            mime_con.add_header('Content-Disposition', 'attachment', filename=name)
+        for header, value  in custom_headers.items():
+            mime_con.add_header(header, value)
+        wrapper.attach(mime_con)
+    rcontent = wrapper.as_string()
+
+    if compress:
+        buf = StringIO.StringIO()
+        gz = gzip.GzipFile(mode='wb', fileobj=buf)
+        try:
+            gz.write(rcontent)
+        finally:
+            gz.close()
+        rcontent = buf.getvalue()
+
+    return rcontent
+
+
+headers = {
+    'encoding': 'Content-Encoding',
+    'mode': 'X-Mode',
+    'owner': 'X-Owner',
+}
+
+type_to_mime = {
+    'packages': 'text/x-packagelist',
+    'file': 'binary/octet-stream',
+    'command': 'text/x-shellscript',
+}
+
+def generate_mime(object_content):
+    content = []
+    for entry in object_content:
+        mimetype = None
+        file_name = None
+        source = None
+        entry_content = None
+        custom_headers = {}
+        if 'source' in entry and 'content' in entry:
+            print >> sys.stderr, "invalid entry, both source and content given, source is '%s'" % source
+            continue
+        if 'source' in entry:
+            source = entry.pop('source')
+            file_name = source
+        if 'file_name' in entry:
+            file_name = entry.pop('file_name')
+        if source is not None:
+            fh = open(source)
+            entry_content = fh.read()
+            fh.close()
+        if 'content' in entry:
+            entry_content = entry.pop('content')
+        elif 'url' in entry:
+            entry_content = retry_url(entry.pop('url'))
+        if 'type' in entry and entry['type'] in type_to_mime:
+            mimetype = type_to_mime[entry['type']]
+        if mimetype is None:
+            contentencondig = None
+            if source is not None:
+                (mimetype, contentencondig) = mimetypes.guess_type(source, strict=False)
+            elif file_name is not None:
+                (mimetype, contentencondig) = mimetypes.guess_type(file_name, strict=False)
+            if contentencondig is not None:
+                custom_headers['Content-Encoding'] = contentencondig
+        if mimetype is None:
+            mimetype = 'binary/octet-stream'
+        for (key, mime_header) in headers.items():
+            if key in entry:
+                # mode (X-Mode) must be an octal string
+                if key == "mode":
+                    custom_headers[mime_header] = oct(entry[key])
+                else:
+                    custom_headers[mime_header] = "%s" % entry[key]
+
+        content.append((file_name, entry_content, mimetype, custom_headers))
+
+    return write_mime_multipart(content, compress=False)
+
+
+def retry_url(url, num_retries=4):
+    for i in range(0, num_retries):
+        try:
+            req = urllib2.Request(url)
+            resp = urllib2.urlopen(req)
+            return resp.read()
+        except urllib2.HTTPError, e:
+            # in 2.6 you use getcode(), in 2.5 and earlier you use code
+            if hasattr(e, 'getcode'):
+                code = e.getcode()
+            else:
+                code = e.code
+            if code == 404:
+                return None
+        except:
+            pass
+        time.sleep(2**i)
+    return ''
+
+
+class Command:
+    def __init__(self):
+        pass
+
+    def get_parser(self):
+        raise NameError('get_parser need to be overriden')
+
+    def parse(self, args):
+        parser = self.get_parser()
+        (verb_options, verb_args) = parser.parse_args(args)
+
+        if len(verb_args) > 0:
+            print "unused arguments: %s" % verb_args
+        self.execute(verb_args, **vars(verb_options))
+
+    def execute(self, args, **kwargs):
+        raise NameError('execute need to be overriden')
+
+class Create(Command):
+    def get_parser(self):
+        parser = optparse.OptionParser(option_class=VariablesOption)
+        parser.add_option("-f", "--file", dest="yaml_source", help="yaml template file", default=None)
+        parser.add_option("-d", "--temp_dir", dest="temp_dir", help="parent folder for temporary directory", default=None)
+        parser.add_option("-v", "--variable", dest="variables", action="store_variable", type="string")
+
+        return parser
+
+    def execute(self, args, yaml_source=None, temp_dir=None, variables={}):
+
+        # yaml is not a default module
+        # so import only when it's needed
+        import yaml
+        # the yaml file is an array of mime headers
+        yaml_file = open(yaml_source, "r")
+        content = yaml_file.read()
+        content = re.sub(r'^#.*\n', '\n', content)
+        template = DotTemplate(content)
+        try:
+            content = template.substitute(variables)
+        except KeyError, e:
+            print >> sys.stderr, "unresolved variable %s" % e
+            return 1
+
+        try:
+            yaml_content = yaml.safe_load(content)
+        except (yaml.scanner.ScannerError, yaml.parser.ParserError), e:
+            print >> sys.stderr, e
+        yaml_file.close()
+
+        tempfile.tempdir = temp_dir
+        dockerdir = tempfile.mkdtemp(prefix='dockertmp.')
+        scriptpath = os.path.realpath(__file__)
+        olddir = os.getcwd()
+        os.chdir(dockerdir)
+        shutil.copyfile(scriptpath, "run")
+        mimecontent = open("mimecontent", "w")
+        print >> mimecontent, generate_mime(yaml_content['execute'])
+        mimecontent.close()
+
+        dockerfile = open("Dockerfile", "w")
+        print >> dockerfile, "FROM %s" % yaml_content['from']
+        print >> dockerfile, "MAINTAINER %s" % yaml_content['maintainer']
+        if 'environment' in yaml_content:
+            for env in yaml_content['environment'].items():
+                print >> dockerfile, "ENV %s %s" % env
+        if "command" in yaml_content:
+            print >> dockerfile, 'CMD ["%s"]' % yaml_content['command']
+        print >> dockerfile, "COPY run /tmp/run"
+        print >> dockerfile, "COPY mimecontent /tmp/mimecontent"
+        print >> dockerfile, 'RUN ["python", "/tmp/run", "decode", "-f", "/tmp/mimecontent", "--purge" ]'
+        dockerfile.close()
+        subprocess.check_call(["docker", "build", '-t="%s"' % yaml_content['tag'], "."], stdout=sys.stdout,  stderr=sys.stdout)
+        os.chdir(olddir)
+        shutil.rmtree(dockerdir)
+
+class MimeDecode(Command):
+
+    def get_parser(self):
+        parser = optparse.OptionParser()
+        parser.add_option("-f", "--file", dest="mime_file", help="MIME multipart file", default=None)
+        parser.add_option("-u", "--URL", dest="mime_url", help="MIME multipart URL", default=None, action="append")
+        parser.add_option("--purge", dest="purge", default=False, action="store_true")
+        parser.add_option("-p", "--packed", dest="do_unpack", help="needs to unpack user date", default=False, action="store_true")
+
+        return parser
+
+    def execute(self, args, mime_file=None, mime_url=None, get_user_date=True, purge=False, **kwargs):
+        temp_dir = tempfile.mkdtemp()
+        olddir = os.getcwd()
+        os.chdir(temp_dir)
+        message = self.get_file(mime_file)
+        if message is not None:
+            self.walk_message(message)
+        os.chdir(olddir)
+        if purge:
+            os.unlink(mime_file)
+            os.unlink(os.path.realpath(__file__))
+
+    def get_string(self, content):
+        return email.message_from_string(content)
+
+    def get_file(self, mime_file):
+        if mime_file == '-':
+            fh = sys.stdin
+        else:
+            fh = open(mime_file)
+        message = email.message_from_file(fh)
+        return message
+
+    def get_url(self, url):
+        fh = self.url_opener.open(url)
+        txt_message = ''
+        url_info = fh.info()
+        for h in url_info.headers:
+            txt_message += h
+        txt_message += '\n'
+        txt_message += fh.read()
+        message = email.message_from_string(txt_message)
+        return message
+
+    def walk_message(self, msg):
+        #depth first, goes into sub-part
+        # walk return the object itself, so the first part is skipped
+        first = True
+        if msg.is_multipart() or msg.get_content_maintype() == 'multipart':
+            for part in msg.walk():
+                # skip the first part, it's the whole message again
+                if first:
+                    first = False
+                    continue
+                self.walk_message(part)
+        else:
+            content_type = msg.get_content_type()
+            main_type = msg.get_content_maintype()
+            if content_type in self.mime_action:
+                self.mime_action[content_type](self, msg)
+            elif main_type in self.mime_action:
+                self.mime_action[main_type](self, msg)
+            else:
+                self.extract_file(msg)
+
+    def walk_include(self, msg):
+        for l in msg.get_payload(None, True).splitlines():
+            l = l.strip()
+            if l.find('http://') == 0:
+                message = self.get_url(l)
+                self.walk_message(message)
+        return
+
+    def extract_file(self, msg, file_name=None, overwrite=True, autoname=False):
+        if file_name is None:
+            file_name = msg.get_filename()
+
+        if file_name is None:
+            if autoname:
+                (fd, file_name) = tempfile.mkstemp(dir=".")
+                os.close(fd)
+                overwrite = True
+            else:
+                return None
+
+        # if overwrite not given, take it from headers
+        if overwrite is None:
+            # Convert a string to a boolean, empty string is false, don't care about the case
+            overwrite = (("%s" % msg.get('X-overwrite'))[0].upper() == 'T')
+
+        # We don't override file
+        if os.path.isfile(file_name) and not overwrite:
+            return os.path.abspath(file_name)
+
+        fh = open(file_name, "w")
+        fh.write(msg.get_payload(None, True))
+        fh.close()
+        if msg.get('Content-Encoding') == 'gzip':
+            subprocess.call(["gunzip", file_name])
+        if 'X-Owner' in msg:
+            try:
+                import grp
+                import pwd
+                (user, group) = msg.get('X-Owner').split(':')
+                uid = pwd.getpwnam(user).pw_uid
+                gid = grp.getgrnam(group).gr_gid
+                os.chown(file_name, uid, gid)
+            except:
+                print "invalid owner: %s for %s" % (msg.get('X-Owner'), file_name)
+        if 'X-Mode' in msg:
+            try:
+                mode = int(msg.get('X-Mode'), 8)
+                os.chmod(file_name, mode)
+            except:
+                print "invalid mode: %s for %s" % (msg.get('X-Mode'), file_name)
+        return os.path.abspath(file_name)
+
+    def run_command(self, msg):
+        cmd_file = self.extract_file(msg, autoname=True)
+        if cmd_file is not None:
+            os.chmod(cmd_file, stat.S_IXUSR | stat.S_IRUSR)
+            try:
+                subprocess.call([cmd_file], stdout=sys.stdout)
+                os.unlink(cmd_file)
+            except Exception, e:
+                print "execution of %s failed with %s" % (cmd_file, e)
+
+    def run_shell_command(self, msg):
+        cmd_file = self.extract_file(msg, autoname=True)
+        if cmd_file is not None:
+            os.chmod(cmd_file, stat.S_IXUSR | stat.S_IRUSR)
+            try:
+                subprocess.call(["/bin/sh", cmd_file], stdout=sys.stdout)
+                os.unlink(cmd_file)
+            except Exception, e:
+                print "execution of %s failed with %s" % (cmd_file, e)
+
+    def install_rpm(self, msg):
+        rpm_file = self.extract_file(msg, autoname=True)
+        if rpm_file is not None:
+            try:
+                os.rename(rpm_file, "%s.rpm" % rpm_file)
+                subprocess.call(["/usr/bin/yum", "-d", "0", "-e", "0", "-y", "install", "%s.rpm" % rpm_file], stdout=sys.stdout)
+            except Exception, e:
+                print "installation of %s failed with %s" % (rpm_file, e)
+
+    def install_deb(self, msg):
+        deb_file = self.extract_file(msg, autoname=True)
+        if deb_file is not None:
+            try:
+                os.rename(deb_file, "%s.rpm" % deb_file)
+                env = {}
+                env.update(os.environ)
+                env["DEBIAN_FRONTEND"] = "noninteractive"
+                subprocess.Popen(["/usr/bin/apt-get", "-f", "-q", "-y", "-o", "DPkg::Options::=--force-confnew", "install", "%s.deb" % deb_file],
+                                 stdout=sys.stdout,  stderr=sys.stdout, env=env).wait()
+            except Exception, e:
+                print "installation of %s failed with %s" % (deb_file, e)
+
+    def facter_fact(self, msg):
+        file_name = os.path.basename(msg.get_filename())
+        file_name = os.path.splitext(file_name)[0]
+        if file_name is None:
+            return None
+
+        if not os.path.isdir('/etc/facter/facts.d'):
+            os.makedirs('/etc/facter/facts.d')
+        file_name = '/etc/facter/facts.d/%s.yaml' % file_name
+        file_name = self.extract_file(msg, file_name=file_name, overwrite=True)
+        os.chmod(file_name, 0)
+        os.chmod(file_name, stat.S_IRUSR | stat.S_IWUSR)
+
+    def set_properties(self, msg):
+        for l in msg.get_payload().splitlines(False):
+            unsafe_vars = ['PATH', 'IFS', 'HOME']
+            l = l.strip()
+            (key, value) = l.split(':', 1)
+            key = key.strip()
+            value = value.strip()
+            if key in unsafe_vars:
+                continue
+            os.environ[key] = value
+
+    def install_packages(self, msg):
+        packages_cmd = ["/usr/bin/yum", "-y", "install"]
+        for l in msg.get_payload().splitlines(False):
+            packages_cmd.append(l.strip())
+        try:
+            subprocess.call(packages_cmd, stdout=sys.stdout)
+        except Exception, e:
+            print "installation of packages failed with: %s" % e
+
+
+MimeDecode.mime_action = {
+    'text/x-include-url': MimeDecode.walk_include,
+    'text/x-shellscript': MimeDecode.run_shell_command,
+    'text/x-executable': MimeDecode.run_command,
+    'text/x-python': MimeDecode.run_command,
+    'application/facter-yaml': MimeDecode.facter_fact,
+    'text/properties':  MimeDecode.set_properties,
+    'text/plain': MimeDecode.extract_file,
+    'application/x-rpm': MimeDecode.install_rpm,
+    'application/vnd.debian.binary-package': MimeDecode.install_deb,
+    'text/x-packagelist': MimeDecode.install_packages,
+}
+
+
+def main():
+    commands = {
+        'decode': MimeDecode(),
+        'create': Create(),
+    }
+
+    usage = "usage: %%prog [options] verb verbs_args\nverbs are:\n    %s" % "\n    ".join(commands.keys())
+
+    parser = optparse.OptionParser(usage=usage)
+    parser.disable_interspersed_args()
+
+    (options, args) = parser.parse_args()
+
+    if len(args) > 0:
+        verb = args.pop(0)
+        cmd = commands[verb]
+        cmd.parse(args)
+    else:
+        print 'action missing'
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(1)

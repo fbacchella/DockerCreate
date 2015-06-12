@@ -1,0 +1,55 @@
+---
+# needed variables are :
+# proxy: a local proxy
+# urlbase: the root URL for a centos and scientific linux miror
+# from: the base image to use
+# example usage:
+# dockercreate create -v proxy http://localhost:3128 -v urlbase http://localhost/mirror -v from centos:7 -f crash.yaml
+tag: crash
+from: ${{from}}
+maintainer: "Fabrice Bacchella <fabrice.bacchella@3ds.com>"
+environment:
+  TZ: CET
+  PS1: "\\w\\$ "
+command: "/install"
+execute:
+    - type: packages
+      content: |
+          crash
+          yum-utils
+          yum-plugin-auto-update-debug-info
+          grubby
+
+    - type: file
+      file_name: /install
+      mode: 0755
+      content: |
+            #!/bin/bash
+            set -x
+            export http_proxy=${{proxy}}
+
+            cd /var/crash/$coredir
+            kernel=$(crash --osrelease vmcore)
+            major=$(echo $kernel | sed 's/.*el\(.\).*/\1/')
+            urlbase=${{urlbase}
+            case "$major" in
+                6) roots=$(echo ScientificLinux/6.{0..6}/x86_64/{os/Packages,updates/{security,fastbugs}})
+                   debuginfourl="http://ftp.scientificlinux.org/linux/fermi/slf6/archive/debuginfo"
+                   ;;
+                7) roots=$(CentOS/7.{0.1406,1.1503}/{os,updates}/x86_64/Packages)
+                   debuginfourl="http://debuginfo.centos.org/7/x86_64"
+                   ;;
+            esac
+
+            echo $roots
+
+            for kp in $roots; do
+                curl -o /dev/null --head -s -f "$urlbase$kp/kernel-$kernel.rpm"
+                if [ $? == 0 ] ; then
+                    curl -s "$urlbase$kp/kernel-$kernel.rpm" | rpm2cpio | (cd / && cpio -i -d)
+                fi
+            done
+            yum install $debuginfourl/kernel-debuginfo-common-x86_64-$kernel.rpm
+            yum install $debuginfourl/kernel-debuginfo-$kernel.rpm
+            ln -s /usr/lib/debug/lib/modules/$kernel kernel
+            exec bash
