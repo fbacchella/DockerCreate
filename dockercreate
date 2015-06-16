@@ -1,6 +1,5 @@
 #!/usr/bin/python
 
-import base64
 import email
 import gzip
 import mimetypes
@@ -9,14 +8,13 @@ import os
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import tempfile
 import shutil
 import string
-import re
 import StringIO
 import urllib2
+import traceback
 
 from email import Encoders
 from email.MIMEMultipart import MIMEMultipart
@@ -24,16 +22,50 @@ from email.MIMEText import MIMEText
 from email.MIMEBase import MIMEBase
 from email.MIMEMultipart import MIMEMultipart
 
+
 # a template that allows . in variables name
 class DotTemplate(string.Template):
     pattern = r"""
     \$(?:
-      {{(?P<braced>[_a-z][_a-z0-9\.]+)}}   |   # delimiter and a braced identifier
+      {{(?P<braced>[_a-z][_a-z0-9\.]*)}}   |   # delimiter and a braced identifier
       (?P<escaped>^$)                      |   # Escape sequence of two delimiters
       (?P<named>^$)                        |   # delimiter and a Python identifier
       (?P<invalid>^$)                          # Other ill-formed delimiter exprs
     )
     """
+
+# A dictionary that resolve string using a template and variables
+class TemplateDict(dict):
+
+    def __init__(self, variables, *args, **kwargs):
+        self.variables = variables
+        super(TemplateDict, self).__init__(*args, **kwargs)
+
+    def __getitem__(self, *args, **kwargs):
+        value = super(TemplateDict, self).__getitem__(*args, **kwargs)
+        return self.resolve(value)
+
+    def items(self, *args, **kwargs):
+        for (key, value) in super(TemplateDict, self).items(*args, **kwargs):
+            yield (key, self.resolve(value))
+
+    def pop(self, *args, **kwargs):
+        value = super(TemplateDict, self).pop(*args, **kwargs)
+        return self.resolve(value)
+
+    def resolve(self, value):
+        if isinstance(value, str):
+            return DotTemplate(value).substitute(self.variables)
+        elif isinstance(value, (list, tuple)):
+            return map(lambda x: self.resolve(x), value)
+        elif isinstance(value, dict):
+            return dict(map(lambda (x, y): (x, self.resolve(y)), value.items()))
+        else:
+            return value
+
+    def getraw(self, key):
+        return super(TemplateDict, self).__getitem__(key)
+
 
 class VariablesOption(optparse.Option):
     ACTIONS = optparse.Option.ACTIONS + ("store_variable", )
@@ -72,7 +104,7 @@ def write_mime_multipart(content, compress=False):
             Encoders.encode_base64(mime_con)
         if name is not None:
             mime_con.add_header('Content-Disposition', 'attachment', filename=name)
-        for header, value  in custom_headers.items():
+        for header, value in custom_headers.items():
             mime_con.add_header(header, value)
         wrapper.attach(mime_con)
     rcontent = wrapper.as_string()
@@ -191,6 +223,7 @@ class Command:
     def execute(self, args, **kwargs):
         raise NameError('execute need to be overriden')
 
+
 class Create(Command):
     def get_parser(self):
         parser = optparse.OptionParser(option_class=VariablesOption)
@@ -207,20 +240,22 @@ class Create(Command):
         import yaml
         # the yaml file is an array of mime headers
         yaml_file = open(yaml_source, "r")
-        content = yaml_file.read()
-        content = re.sub(r'^#.*\n', '\n', content)
-        template = DotTemplate(content)
         try:
-            content = template.substitute(variables)
-        except KeyError, e:
-            print >> sys.stderr, "unresolved variable %s" % e
-            return 1
-
-        try:
-            yaml_content = yaml.safe_load(content)
+            yaml_content = yaml.safe_load(yaml_file)
         except (yaml.scanner.ScannerError, yaml.parser.ParserError), e:
             print >> sys.stderr, e
         yaml_file.close()
+
+        # resolve variables expression
+        for (var, expression) in yaml_content.pop('variables', {}).items():
+            try:
+                variables[var] = eval(expression, {}, variables)
+            except Exception as e:
+                print >> sys.stderr, "evaluation failed for %s:" % (expression)
+                for l in traceback.format_exception_only(type(e), e):
+                    print "    " + l,
+
+        yaml_content = TemplateDict(variables, yaml_content)
 
         tempfile.tempdir = temp_dir
         dockerdir = tempfile.mkdtemp(prefix='dockertmp.')
@@ -249,6 +284,7 @@ class Create(Command):
         subprocess.check_call(["docker", "build", '-t="%s"' % yaml_content['tag'], "."], stdout=sys.stdout,  stderr=sys.stdout)
         os.chdir(olddir)
         shutil.rmtree(dockerdir)
+
 
 class MimeDecode(Command):
 

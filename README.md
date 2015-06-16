@@ -70,3 +70,15 @@ Variables
 The template can use variable, they are defined in the format ${{variable_name}}.
 
 They are given as `-v name value` in the command line
+
+It the template contains a `variables` section, it can define new variable. In this case, each element is a 
+new variable and a python expression that will resolve it, using the already defined variables.
+
+For example, if dockercreate is launched with `-v key 1` and the template containes:
+
+    variables:
+       v1: int(key) * 2
+       v2: {'1': 'a'}[key]
+
+it will add a variable `v1` with value `2` and `v2` with value `'a'`. All variable are strings and so must
+be converted before use a int or other types
