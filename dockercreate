@@ -250,7 +250,8 @@ class Create(Command):
         for (var, expression) in yaml_content.pop('variables', {}).items():
             try:
                 variables[var] = eval(expression, {}, variables)
-            except Exception as e:
+            except:
+                (exc_type, e, exc_traceback) = sys.exc_info()
                 print >> sys.stderr, "evaluation failed for %s:" % (expression)
                 for l in traceback.format_exception_only(type(e), e):
                     print "    " + l,
